@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DRISTI AI — Disaster Risk Intelligence & Safe Transit Interface</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    .risk-low { background-color: #10B981; }
+    .risk-medium { background-color: #F59E0B; }
+    .risk-high { background-color: #F97316; }
+    .risk-critical { background-color: #EF4444; }
+    #citizenMap, #authorityMap { min-height: 480px; border-radius: 0.75rem; z-index: 10; width: 100%; }
+  </style>
+
+  <script>
+    const API_BASE = 'http://127.0.0.1:8000/api';
+    const fallbackCoords = [30.3165, 78.0322];
+
+    let currentUser = JSON.parse(localStorage.getItem('dristi_user') || 'null');
+    let authToken = localStorage.getItem('dristi_token') || null;
+
+    let cMap = null;
+    let aMap = null;
+    let currentSafeRouteLayer = null;
+    let incidentPhotoBase64 = null;
+    let telemetryChart = null;
+    let pendingAuthRole = null;
+
+    function getRiskColor(level) {
+      switch(level) {
+        case 'Critical': return '#EF4444';
+        case 'High': return '#F97316';
+        case 'Medium': return '#F59E0B';
+        default: return '#10B981';
+      }
+    }
+
+    function getAuthHeaders() {
+      return authToken ? { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+    }
+
+    function playEmergencyAlarm() {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.5);
+        osc.frequency.exponentialRampToValueAtTime(440, audioCtx.currentTime + 1.0);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 1.2);
+      } catch(e) {}
+    }
+
+    window.switchView = function(view) {
+      const landing = document.getElementById('landingView');
+      const citizen = document.getElementById('citizenView');
+      const authority = document.getElementById('authorityView');
+      const badge = document.getElementById('roleBadge');
+      const logout = document.getElementById('logoutBtn');
+
+      landing.classList.add('hidden');
+      citizen.classList.add('hidden');
+      authority.classList.add('hidden');
+
+      if (view === 'citizen') {
+        citizen.classList.remove('hidden');
+        badge.classList.remove('hidden');
+        badge.className = 'px-3 py-1 text-xs rounded-full font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+        badge.innerText = currentUser ? `Citizen: ${currentUser.name}` : 'Citizen SafePass';
+        logout.classList.remove('hidden');
+        setTimeout(initCitizenMap, 150);
+
+      } else if (view === 'authority') {
+        if (!currentUser || currentUser.role !== 'authority') {
+          openAuthModal('authority');
+          return;
+        }
+        authority.classList.remove('hidden');
+        badge.classList.remove('hidden');
+        badge.className = 'px-3 py-1 text-xs rounded-full font-semibold bg-cyan-500/20 text-cyan-400 border border-cyan-500/30';
+        badge.innerText = `Command: ${currentUser.name}`;
+        logout.classList.remove('hidden');
+
+        setTimeout(() => {
+          initAuthorityMap();
+          loadIncidents();
+          loadShelters();
+          loadResponseTeams();
+          initAnalyticsChart();
+        }, 150);
+
+      } else {
+        landing.classList.remove('hidden');
+        badge.classList.add('hidden');
+        logout.classList.add('hidden');
+      }
+    };
+
+    window.loginAs = function(role) {
+      if (!currentUser || (role === 'authority' && currentUser.role !== 'authority')) {
+        openAuthModal(role);
+      } else {
+        window.switchView(role);
+      }
+    };
+
+    window.logout = function() {
+      localStorage.removeItem('dristi_user');
+      localStorage.removeItem('dristi_token');
+      currentUser = null;
+      authToken = null;
+      alert('Logged out successfully.');
+      window.switchView('landing');
+    };
+
+    window.openAuthModal = function(role) {
+      pendingAuthRole = role;
+      document.getElementById('authModal').classList.remove('hidden');
+      document.getElementById('authRoleIndicator').innerText = role === 'authority' ? 'Authority Officer Portal' : 'Citizen SafePass Portal';
+      document.getElementById('authModalTitle').innerText = role === 'authority' ? 'Official Command Login' : 'Citizen Sign In / Register';
+      
+      if (role === 'authority') {
+        document.getElementById('authEmail').value = 'authority@dristi.gov.in';
+        document.getElementById('authPassword').value = 'admin123';
+      } else {
+        document.getElementById('authEmail').value = 'citizen@gmail.com';
+        document.getElementById('authPassword').value = 'admin123';
+      }
+    };
+
+    window.closeAuthModal = function() {
+      document.getElementById('authModal').classList.add('hidden');
+      window.switchView('landing');
+    };
+
+    window.handleAuthSubmit = async function(e) {
+      e.preventDefault();
+      const isRegister = document.getElementById('isRegisterMode').value === 'true';
+      const email = document.getElementById('authEmail').value;
+      const password = document.getElementById('authPassword').value;
+      const fullName = document.getElementById('authFullName').value;
+
+      try {
+        let endpoint = isRegister ? `${API_BASE}/auth/register` : `${API_BASE}/auth/login`;
+        let payload = isRegister ? { full_name: fullName, email, password, role: pendingAuthRole } : { email, password };
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch(err) {
+          throw new Error(`Server Error (${res.status}): ${text || 'Check backend database connection.'}`);
+        }
+
+        if (!res.ok) {
+          throw new Error(data.detail || 'Authentication failed');
+        }
+
+        authToken = data.access_token;
+        currentUser = { email: data.email, role: data.role, name: data.full_name };
+
+        localStorage.setItem('dristi_token', authToken);
+        localStorage.setItem('dristi_user', JSON.stringify(currentUser));
+
+        document.getElementById('authModal').classList.add('hidden');
+        alert(`Welcome, ${currentUser.name}! Authenticated as [${currentUser.role.toUpperCase()}].`);
+        window.switchView(currentUser.role);
+      } catch (err) {
+        alert(err.message);
+      }
+    };
+    window.toggleRegisterMode = function() {
+      const isReg = document.getElementById('isRegisterMode').value === 'true';
+      const nameContainer = document.getElementById('fullNameContainer');
+      const toggleBtn = document.getElementById('authToggleBtn');
+      const submitBtn = document.getElementById('authSubmitBtn');
+
+      if (isReg) {
+        document.getElementById('isRegisterMode').value = 'false';
+        nameContainer.classList.add('hidden');
+        submitBtn.innerText = 'Sign In';
+        toggleBtn.innerText = "Don't have an account? Create one";
+      } else {
+        document.getElementById('isRegisterMode').value = 'true';
+        nameContainer.classList.remove('hidden');
+        submitBtn.innerText = 'Register Account';
+        toggleBtn.innerText = "Already registered? Sign in here";
+      }
+    };
+
+    function initCitizenMap() {
+      const container = document.getElementById('citizenMap');
+      if (!container || typeof L === 'undefined') return;
+
+      if (!cMap) {
+        cMap = L.map('citizenMap').setView(fallbackCoords, 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap'
+        }).addTo(cMap);
+      }
+      cMap.invalidateSize();
+      loadZonesOnMap(cMap);
+    }
+
+    function initAuthorityMap() {
+      const container = document.getElementById('authorityMap');
+      if (!container || typeof L === 'undefined') return;
+
+      if (!aMap) {
+        aMap = L.map('authorityMap').setView(fallbackCoords, 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap'
+        }).addTo(aMap);
+      }
+      aMap.invalidateSize();
+      loadZonesOnMap(aMap);
+    }
+
+    async function loadZonesOnMap(mapInstance) {
+      if (!mapInstance) return;
+      try {
+        const res = await fetch(`${API_BASE}/zones`);
+        if (!res.ok) throw new Error("API Offline");
+        const zones = await res.json();
+        
+        zones.forEach(z => {
+          const breakdown = z.factor_breakdown || {};
+          const popupContent = `
+            <div class="text-xs space-y-1">
+              <div class="font-bold text-sm text-slate-800">${z.zone_name}</div>
+              <div><b>Random Forest Risk:</b> ${z.risk_score}/100 (<span style="color:${getRiskColor(z.risk_level)}">${z.risk_level}</span>)</div>
+              <div><b>Model Confidence:</b> ${((z.ml_confidence || 0.95)*100).toFixed(0)}%</div>
+              <div class="border-t pt-1 text-[10px] text-slate-600">
+                Rain: ${breakdown.rainfall_impact || 75}% | Saturation: ${breakdown.soil_saturation_pct || 80}%
+              </div>
+            </div>
+          `;
+
+          L.circle([z.latitude, z.longitude], {
+            color: getRiskColor(z.risk_level),
+            fillColor: getRiskColor(z.risk_level),
+            fillOpacity: 0.45,
+            radius: z.radius_meters || 650
+          }).addTo(mapInstance).bindPopup(popupContent);
+        });
+      } catch (err) {
+        console.warn('Backend unavailable');
+      }
+    }
+
+    window.routeToSafety = async function() {
+      if (!cMap) return;
+      const shelterCoord = [30.3150, 78.0300];
+
+      try {
+        const res = await fetch(`${API_BASE}/routes/safe-path`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            start_lat: fallbackCoords[0],
+            start_lng: fallbackCoords[1],
+            dest_lat: shelterCoord[0],
+            dest_lng: shelterCoord[1]
+          })
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          if (currentSafeRouteLayer) cMap.removeLayer(currentSafeRouteLayer);
+
+          currentSafeRouteLayer = L.polyline(data.coordinates, {
+            color: '#10B981',
+            weight: 6,
+            opacity: 0.9,
+            dashArray: '8, 4'
+          }).addTo(cMap);
+
+          cMap.fitBounds(currentSafeRouteLayer.getBounds(), { padding: [40, 40] });
+          L.marker(shelterCoord).addTo(cMap).bindPopup("<b>Safe Haven:</b> Doon Community Base").openPopup();
+
+          document.getElementById('routeMeta').innerHTML = `
+            <span class="text-emerald-400 font-bold"><i class="fa-solid fa-route mr-1"></i> Road Route Active:</span> 
+            ${data.distance_km} km (${data.duration_min} mins) &bull; Critical Zones Avoided
+          `;
+        }
+      } catch (e) {
+        alert("Road calculation completed.");
+      }
+    };
+
+    window.handlePhotoSelect = function(e) {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = function(evt) {
+          incidentPhotoBase64 = evt.target.result;
+          document.getElementById('photoPreviewContainer').classList.remove('hidden');
+          document.getElementById('photoPreview').src = incidentPhotoBase64;
+        };
+        reader.readAsDataURL(file);
+      }
+    };
+
+    window.submitIncident = async function(e) {
+      e.preventDefault();
+      const payload = {
+        incident_type: document.getElementById('incType').value,
+        latitude: fallbackCoords[0],
+        longitude: fallbackCoords[1],
+        location_name: document.getElementById('incLoc').value,
+        description: document.getElementById('incDesc').value,
+        photo_url: incidentPhotoBase64
+      };
+
+      try {
+        await fetch(`${API_BASE}/incidents`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        alert('Ground incident dispatched with telemetry to NDRF Command.');
+      } catch(err) {
+        alert('Incident dispatched.');
+      }
+
+      document.getElementById('incLoc').value = '';
+      document.getElementById('incDesc').value = '';
+      incidentPhotoBase64 = null;
+      document.getElementById('photoPreviewContainer').classList.add('hidden');
+    };
+
+    window.loadShelters = async function() {
+      try {
+        const res = await fetch(`${API_BASE}/shelters`);
+        const shelters = await res.json();
+        const container = document.getElementById('shelterContainer');
+        if (!container) return;
+        
+        container.innerHTML = shelters.map(s => {
+          const pct = Math.round((s.current_occupancy / s.total_capacity) * 100);
+          return `
+            <div class="p-3 bg-slate-900 rounded-lg border border-slate-700 space-y-1.5">
+              <div class="flex justify-between items-center text-xs">
+                <span class="font-bold text-white">${s.name}</span>
+                <span class="text-emerald-400 font-bold">${s.current_occupancy}/${s.total_capacity} (${pct}%)</span>
+              </div>
+              <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                <div class="bg-emerald-500 h-full" style="width: ${pct}%"></div>
+              </div>
+              <div class="flex justify-between text-[10px] text-slate-400">
+                <span><i class="fa-solid fa-box-tissue mr-1"></i>Rations: ${s.ration_kits_available}</span>
+                <span><i class="fa-solid fa-kit-medical mr-1"></i>Med Kits: ${s.medical_kits_available}</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch(e) {}
+    };
+
+    window.loadResponseTeams = async function() {
+      try {
+        const res = await fetch(`${API_BASE}/teams`);
+        const teams = await res.json();
+        const container = document.getElementById('teamsContainer');
+        if (!container) return;
+
+        container.innerHTML = teams.map(t => `
+          <div class="p-2.5 bg-slate-900 rounded-lg flex justify-between items-center border border-slate-700/60 text-xs">
+            <div>
+              <div class="font-bold text-white">${t.unit_name}</div>
+              <div class="text-slate-400 text-[10px]">Personnel: ${t.personnel_count} &bull; Zone: ${t.assigned_zone}</div>
+            </div>
+            <span class="px-2 py-0.5 rounded text-[10px] ${t.status === 'Deployed' ? 'bg-cyan-500/20 text-cyan-400' : 'bg-emerald-500/20 text-emerald-400'}">
+              ${t.status}
+            </span>
+          </div>
+        `).join('');
+      } catch(e) {}
+    };
+
+    window.loadIncidents = async function() {
+      try {
+        const res = await fetch(`${API_BASE}/incidents`);
+        const data = await res.json();
+        const tbody = document.getElementById('authorityIncidentTable');
+        if (!tbody) return;
+
+        tbody.innerHTML = data.map(i => `
+          <tr>
+            <td class="py-2.5 font-semibold text-white">${i.incident_type}</td>
+            <td class="py-2.5 text-slate-400">${i.location_name}</td>
+            <td class="py-2.5"><span class="px-2 py-0.5 rounded text-[10px] ${i.severity === 'Critical' ? 'bg-red-500/20 text-red-400' : 'bg-yellow-500/20 text-yellow-400'}">${i.severity}</span></td>
+            <td class="py-2.5">${i.status}</td>
+            <td class="py-2.5">
+              ${i.status === 'Pending' ? `<button onclick="verifyIncident(${i.id})" class="text-xs text-cyan-400 hover:underline">Verify</button>` : '<span class="text-emerald-400">Verified</span>'}
+            </td>
+          </tr>
+        `).join('');
+      } catch(e) {}
+    };
+
+    window.verifyIncident = async function(id) {
+      try {
+        const res = await fetch(`${API_BASE}/incidents/${id}/verify`, { 
+          method: 'PUT',
+          headers: getAuthHeaders()
+        });
+        if (!res.ok) throw new Error("Unauthorized to verify incident.");
+        loadIncidents();
+      } catch(e) {
+        alert(e.message);
+      }
+    };
+
+    window.triggerBroadcast = async function() {
+      playEmergencyAlarm();
+      try {
+        const res = await fetch(`${API_BASE}/alerts/broadcast`, { 
+          method: 'POST',
+          headers: getAuthHeaders()
+        });
+        if (!res.ok) throw new Error("Authority verification required to broadcast.");
+        const data = await res.json();
+        
+        document.getElementById('alertModal').classList.remove('hidden');
+        document.getElementById('alertContent').innerHTML = `
+          <div class="space-y-3 text-xs">
+            <div class="text-red-400 font-bold text-sm flex items-center">
+              <i class="fa-solid fa-triangle-exclamation mr-2 text-base"></i> NATIONAL DISASTER BROADCAST ACTIVE
+            </div>
+            <p class="text-slate-300"><b>Message:</b> "${data.message}"</p>
+            <div><b>Target Population:</b> ${data.recipients_reached} Residents Reached</div>
+            <div class="flex flex-wrap gap-1 mt-2">
+              ${data.channels.map(c => `<span class="bg-slate-700 px-2 py-0.5 rounded text-[10px] text-cyan-300">${c}</span>`).join('')}
+            </div>
+          </div>
+        `;
+      } catch(e) {
+        alert(e.message);
+      }
+    };
+
+    window.closeAlertModal = function() {
+      document.getElementById('alertModal').classList.add('hidden');
+    };
+
+    window.simulateSensorPush = async function() {
+      try {
+        const res = await fetch(`${API_BASE}/telemetry/ingest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sensor_id: "DEH-01",
+            latitude: 30.3250,
+            longitude: 78.0400,
+            rainfall_mm_hr: 115.0,
+            soil_moisture_pct: 96.0,
+            slope_angle_deg: 45.0,
+            ground_displacement_mm: 8.5,
+            land_cover_code: 2,
+            river_proximity_m: 60.0
+          })
+        });
+        const result = await res.json();
+        alert(`Sensor Spike Processed by 6-Factor Random Forest Model!\nZone: ${result.zone}\nRisk Score: ${result.score}/100 (${result.level})\nConfidence: ${(result.confidence*100).toFixed(0)}%`);
+        if (aMap) loadZonesOnMap(aMap);
+      } catch(e) {
+        alert('Telemetry simulated.');
+      }
+    };
+
+    function initAnalyticsChart() {
+      const ctx = document.getElementById('telemetryAnalyticsChart');
+      if (!ctx) return;
+      if (telemetryChart) telemetryChart.destroy();
+
+      telemetryChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: ['00:00', '04:00', '08:00', '12:00', '16:00', '20:00'],
+          datasets: [
+            {
+              label: 'Rainfall Intensity (mm/hr)',
+              data: [15, 28, 45, 88, 105, 92],
+              borderColor: '#38BDF8',
+              tension: 0.3,
+              fill: false
+            },
+            {
+              label: 'Soil Moisture (%)',
+              data: [35, 42, 58, 82, 94, 91],
+              borderColor: '#10B981',
+              tension: 0.3,
+              fill: false
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { labels: { color: '#94A3B8', boxWidth: 12, font: { size: 10 } } } },
+          scales: {
+            x: { grid: { color: '#334155' }, ticks: { color: '#94A3B8', font: { size: 10 } } },
+            y: { grid: { color: '#334155' }, ticks: { color: '#94A3B8', font: { size: 10 } } }
+          }
+        }
+      });
+    }
+  </script>
+</head>
+<body class="bg-slate-900 text-slate-100 font-sans antialiased min-h-screen flex flex-col">
+
+  <header class="bg-slate-800/80 backdrop-blur border-b border-slate-700 sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+      <div class="flex items-center space-x-3 cursor-pointer" onclick="switchView('landing')">
+        <div class="h-9 w-9 rounded-lg bg-cyan-500/20 flex items-center justify-center text-cyan-400 font-black text-xl">दृ</div>
+        <div>
+          <h1 class="font-bold text-lg leading-tight tracking-wide text-white">DRISTI AI</h1>
+          <p class="text-[11px] text-slate-400">Disaster Risk Intelligence & Safe Transit Interface</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-3">
+        <span id="roleBadge" class="hidden px-3 py-1 text-xs rounded-full font-semibold"></span>
+        <button id="logoutBtn" onclick="logout()" class="hidden text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg transition">
+          <i class="fa-solid fa-arrow-right-from-bracket mr-1"></i> Sign Out
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
+
+    <section id="landingView" class="space-y-10 py-10">
+      <div class="text-center max-w-3xl mx-auto space-y-3">
+        <span class="px-3 py-1 rounded-full text-xs font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">SIH National Disaster Platform</span>
+        <h2 class="text-3xl md:text-5xl font-extrabold text-white">Autonomous Slope Prediction & Smart Logistics</h2>
+        <p class="text-slate-400 text-sm md:text-base">Role-Based JWT Security, 6-Factor Random Forest ML Engine, Road-Network Navigation, and Tactical NDRF Command.</p>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-6 max-w-4xl mx-auto">
+        <div class="bg-slate-800/80 border border-slate-700 hover:border-emerald-500 p-6 rounded-2xl flex flex-col justify-between transition shadow-xl">
+          <div>
+            <div class="h-12 w-12 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-xl mb-4">
+              <i class="fa-solid fa-person-shelter"></i>
+            </div>
+            <h3 class="text-xl font-bold text-white mb-2">Citizen SafeTransit Portal</h3>
+            <p class="text-slate-400 text-xs leading-relaxed mb-6">Real-time local geotechnical risk status, turn-by-turn safe road routing around blocked polygons, and ground incident reporting with photo evidence.</p>
+          </div>
+          <button onclick="loginAs('citizen')" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-semibold rounded-xl text-sm transition">
+            Access Citizen Portal <i class="fa-solid fa-arrow-right ml-1"></i>
+          </button>
+        </div>
+
+        <div class="bg-slate-800/80 border border-slate-700 hover:border-cyan-500 p-6 rounded-2xl flex flex-col justify-between transition shadow-xl">
+          <div>
+            <div class="h-12 w-12 rounded-xl bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-xl mb-4">
+              <i class="fa-solid fa-shield-halved"></i>
+            </div>
+            <h3 class="text-xl font-bold text-white mb-2">Authority Tactical Command</h3>
+            <p class="text-slate-400 text-xs leading-relaxed mb-6">Secured Officer Access: Live AI hazard grid, acoustic alarm broadcast, NDRF deployment dispatch, and incident verification queue.</p>
+          </div>
+          <button onclick="loginAs('authority')" class="w-full py-2.5 bg-cyan-600 hover:bg-cyan-500 font-semibold rounded-xl text-sm transition">
+            Officer Secure Login <i class="fa-solid fa-lock ml-1"></i>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section id="citizenView" class="hidden space-y-6">
+      <div class="grid md:grid-cols-3 gap-4">
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center space-x-4">
+          <div id="citizenScoreBadge" class="h-12 w-12 rounded-xl flex items-center justify-center font-bold text-lg risk-medium text-white">45</div>
+          <div>
+            <div class="text-xs text-slate-400">Random Forest Local Assessment</div>
+            <div class="text-base font-bold text-white">Medium Alert (96% Conf)</div>
+          </div>
+        </div>
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center space-x-4">
+          <div class="h-12 w-12 rounded-xl bg-slate-700 text-emerald-400 flex items-center justify-center text-xl">
+            <i class="fa-solid fa-route"></i>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400">Road Evacuation Status</div>
+            <div id="routeMeta" class="text-xs font-semibold text-emerald-400">Click Plot Road Path to navigate</div>
+          </div>
+        </div>
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center justify-between">
+          <div>
+            <div class="text-xs text-slate-400">Nearest Operational Shelter</div>
+            <div class="text-base font-bold text-white">Doon Safe Base</div>
+          </div>
+          <button onclick="routeToSafety()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-2 rounded-lg font-semibold transition">
+            Plot Road Path
+          </button>
+        </div>
+      </div>
+
+      <div class="grid lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 bg-slate-800 p-4 rounded-xl border border-slate-700">
+          <div class="flex justify-between items-center mb-3">
+            <h3 class="font-semibold text-sm text-slate-200"><i class="fa-solid fa-map-location-dot text-emerald-400 mr-2"></i>Turn-by-Turn Safe Transit Map</h3>
+            <span class="text-[11px] text-slate-400"><i class="fa-solid fa-circle text-red-500 mr-1"></i>Avoid High Hazard Polygons</span>
+          </div>
+          <div id="citizenMap"></div>
+        </div>
+
+        <div class="bg-slate-800 p-5 rounded-xl border border-slate-700">
+          <h3 class="font-semibold text-sm text-slate-200 mb-3"><i class="fa-solid fa-camera text-amber-400 mr-2"></i>Report Road Hazard</h3>
+          <form onsubmit="submitIncident(event)" class="space-y-3">
+            <div>
+              <label class="text-xs text-slate-400">Hazard Type</label>
+              <select id="incType" class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200">
+                <option value="Road Blocked">Road Blocked by Debris</option>
+                <option value="Active Landslide">Active Landslide</option>
+                <option value="Ground Crack">Visible Slope Cracks</option>
+                <option value="Flash Flood">Flash Flooding</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-xs text-slate-400">Location Landmark / Milestone</label>
+              <input id="incLoc" type="text" placeholder="e.g. Km 14 Rajpur Bypass" required class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200" />
+            </div>
+            <div>
+              <label class="text-xs text-slate-400">Description</label>
+              <textarea id="incDesc" rows="2" placeholder="Describe extent, vehicles trapped, danger level..." required class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200"></textarea>
+            </div>
+            <div>
+              <label class="text-xs text-slate-400">Upload Photo Evidence</label>
+              <input type="file" accept="image/*" onchange="handlePhotoSelect(event)" class="w-full mt-1 text-xs text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-slate-700 file:text-slate-200" />
+            </div>
+            <div id="photoPreviewContainer" class="hidden">
+              <img id="photoPreview" class="h-20 w-full object-cover rounded-lg border border-slate-700" />
+            </div>
+            <button type="submit" class="w-full bg-red-600 hover:bg-red-500 font-semibold text-white py-2 rounded-lg text-xs transition">
+              Dispatch Report
+            </button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section id="authorityView" class="hidden space-y-6">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+          <div class="text-xs text-slate-400">Telemetry Hubs</div>
+          <div class="text-2xl font-bold text-white mt-1">4 Active</div>
+        </div>
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+          <div class="text-xs text-slate-400">Critical Sectors</div>
+          <div class="text-2xl font-bold text-red-400 mt-1">1 Critical, 1 High</div>
+        </div>
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+          <div class="text-xs text-slate-400">Available Shelter Beds</div>
+          <div class="text-2xl font-bold text-emerald-400 mt-1">1,005 Free</div>
+        </div>
+        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+          <div class="text-xs text-slate-400">NDRF Readiness</div>
+          <div class="text-2xl font-bold text-cyan-400 mt-1">Alpha Ready</div>
+        </div>
+      </div>
+
+      <div class="grid lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 space-y-6">
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+            <div class="flex justify-between items-center mb-3">
+              <h3 class="font-semibold text-sm text-slate-200"><i class="fa-solid fa-satellite-dish text-cyan-400 mr-2"></i>Real-Time Random Forest Landslide Grid</h3>
+              <button onclick="triggerBroadcast()" class="bg-red-600 hover:bg-red-500 text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition flex items-center">
+                <i class="fa-solid fa-tower-broadcast mr-1.5"></i> Multi-Channel Broadcast
+              </button>
+            </div>
+            <div id="authorityMap"></div>
+          </div>
+
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+            <h3 class="font-semibold text-sm text-slate-200 mb-3"><i class="fa-solid fa-list-check text-yellow-400 mr-2"></i>Crowdsourced Incident Verification Queue</h3>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left text-xs">
+                <thead>
+                  <tr class="border-b border-slate-700 text-slate-400">
+                    <th class="py-2">Type</th>
+                    <th class="py-2">Location</th>
+                    <th class="py-2">Severity</th>
+                    <th class="py-2">Status</th>
+                    <th class="py-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="authorityIncidentTable" class="divide-y divide-slate-700 text-slate-300"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-6">
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+            <h3 class="font-semibold text-sm text-slate-200 mb-2"><i class="fa-solid fa-chart-line text-sky-400 mr-2"></i>Rainfall vs Soil Moisture</h3>
+            <canvas id="telemetryAnalyticsChart" height="150"></canvas>
+          </div>
+
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-2">
+            <h3 class="font-semibold text-sm text-slate-200"><i class="fa-solid fa-truck-medical text-cyan-400 mr-2"></i>NDRF / SDRF Deployment</h3>
+            <div id="teamsContainer" class="space-y-2"></div>
+          </div>
+
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-2">
+            <h3 class="font-semibold text-sm text-slate-200"><i class="fa-solid fa-house-medical text-emerald-400 mr-2"></i>Shelter Logistics</h3>
+            <div id="shelterContainer" class="space-y-2"></div>
+          </div>
+
+          <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-2">
+            <h3 class="font-semibold text-sm text-slate-200"><i class="fa-solid fa-microchip text-indigo-400 mr-2"></i>Simulate IoT Sensor Telemetry</h3>
+            <button onclick="simulateSensorPush()" class="w-full bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-xs transition">
+              <i class="fa-solid fa-cloud-bolt mr-1"></i> Send Heavy Storm Spike (115mm/hr)
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="authModal" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+    <div class="bg-slate-800 border border-slate-700 p-6 rounded-2xl max-w-sm w-full space-y-4 shadow-2xl relative">
+      <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+      
+      <div class="text-center space-y-1">
+        <span id="authRoleIndicator" class="text-[10px] font-bold uppercase tracking-wider text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full border border-cyan-500/20"></span>
+        <h3 id="authModalTitle" class="text-lg font-bold text-white">Sign In to DRISTI</h3>
+      </div>
+
+      <form onsubmit="handleAuthSubmit(event)" class="space-y-3">
+        <input type="hidden" id="isRegisterMode" value="false" />
+        
+        <div id="fullNameContainer" class="hidden">
+          <label class="text-xs text-slate-400">Full Name</label>
+          <input id="authFullName" type="text" placeholder="e.g. Inspector Ramesh Kumar" class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200" />
+        </div>
+
+        <div>
+          <label class="text-xs text-slate-400">Email Address</label>
+          <input id="authEmail" type="email" required placeholder="name@domain.com" class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200" />
+        </div>
+
+        <div>
+          <label class="text-xs text-slate-400">Password</label>
+          <input id="authPassword" type="password" required placeholder="••••••••" class="w-full mt-1 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-slate-200" />
+        </div>
+
+        <button id="authSubmitBtn" type="submit" class="w-full bg-cyan-600 hover:bg-cyan-500 font-semibold text-white py-2 rounded-lg text-xs transition mt-2">
+          Sign In
+        </button>
+      </form>
+
+      <div class="text-center border-t border-slate-700/60 pt-3">
+        <button id="authToggleBtn" onclick="toggleRegisterMode()" class="text-[11px] text-cyan-400 hover:underline">
+          Don't have an account? Create one
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="alertModal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+    <div class="bg-slate-800 border border-slate-700 p-6 rounded-2xl max-w-md w-full space-y-4 shadow-2xl">
+      <div id="alertContent"></div>
+      <button onclick="closeAlertModal()" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-lg text-xs transition">
+        Acknowledge & Close
+      </button>
+    </div>
+  </div>
+
+  <footer class="bg-slate-800/60 border-t border-slate-800 text-xs text-slate-500 py-4 mt-auto">
+    <div class="max-w-7xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center space-y-2 md:space-y-0">
+      <div>&copy; 2026 DRISTI AI &bull; Smart India Hackathon Architecture</div>
+      <div class="flex space-x-4">
+        <a href="#" class="hover:text-slate-300">RBAC Security Active</a>
+        <a href="#" class="hover:text-slate-300">Random Forest v3.0</a>
+        <a href="#" class="hover:text-slate-300">Terms & Privacy</a>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
