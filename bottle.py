@@ -1,4 +1,4 @@
-#!C:\Users\SONU\OneDrive\Desktop\DRISTI\backend\venv\Scripts\python.exe
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 """
